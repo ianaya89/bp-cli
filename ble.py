@@ -148,7 +148,7 @@ async def sync_records(address: str, progress_cb=None, debug_cb=None) -> list[di
 
         # Set device clock so future measurements get timestamps
         try:
-            await client.write_gatt_char(CURRENT_TIME, _current_time_bytes(), response=False)
+            await client.write_gatt_char(CURRENT_TIME, _current_time_bytes(), response=True)
             dbg("CURRENT_TIME  write OK")
         except Exception as e:
             dbg(f"CURRENT_TIME  write FAILED: {e}")

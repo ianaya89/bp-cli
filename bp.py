@@ -15,6 +15,7 @@ from rich import box
 
 import ble
 import db
+import devices
 
 app = typer.Typer(no_args_is_help=True, help="Omron BP monitor sync tool")
 console = Console()
@@ -108,10 +109,14 @@ def scan(
 
 @app.command()
 def sync(
-    address: str = typer.Argument(..., help="Device UUID/address from scan"),
+    address: str = typer.Argument(..., help="Device name (from bp devices) or UUID/address"),
     user: Optional[int] = typer.Option(None, help="Filter by user slot (1 or 2)"),
 ):
     """Connect to device and sync all stored records."""
+    resolved = devices.resolve(address)
+    if resolved != address:
+        console.print(f"[dim]{address}[/dim] → [bold]{resolved}[/bold]")
+
     conn = db.init_db()
     new_count = 0
     total = 0
@@ -132,9 +137,9 @@ def sync(
             f"pulse {rec.get('pulse', '—')}"
         )
 
-    console.print(f"Connecting to [bold]{address}[/bold]…")
+    console.print(f"Connecting to [bold]{resolved}[/bold]…")
     try:
-        asyncio.run(ble.sync_records(address, progress_cb=on_record))
+        asyncio.run(ble.sync_records(resolved, progress_cb=on_record))
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)
@@ -360,6 +365,45 @@ def chart(
     plt.title(f"Blood Pressure{' — User ' + str(user) if user else ''}")
 
     plt.show()
+
+
+devices_app = typer.Typer(help="Manage saved device aliases.")
+app.add_typer(devices_app, name="devices")
+
+
+@devices_app.command(name="add")
+def devices_add(
+    name: str = typer.Argument(..., help="Friendly name"),
+    address: str = typer.Argument(..., help="Device UUID/address from bp scan"),
+):
+    """Save a friendly name for a device address."""
+    devices.add(name, address)
+    console.print(f"[green]Saved:[/green] [bold]{name}[/bold] → {address}")
+
+
+@devices_app.command(name="rm")
+def devices_rm(name: str = typer.Argument(..., help="Name to remove")):
+    """Remove a saved device alias."""
+    if devices.remove(name):
+        console.print(f"[dim]Removed:[/dim] {name}")
+    else:
+        console.print(f"[yellow]Not found:[/yellow] {name}")
+        raise typer.Exit(1)
+
+
+@devices_app.command(name="ls")
+def devices_ls():
+    """List all saved device aliases."""
+    saved = devices.list_all()
+    if not saved:
+        console.print("[dim]No saved devices. Use: bp devices add <name> <uuid>[/dim]")
+        return
+    t = Table(box=box.SIMPLE_HEAD)
+    t.add_column("Name", style="bold")
+    t.add_column("Address / UUID")
+    for name, addr in saved.items():
+        t.add_row(name, addr)
+    console.print(t)
 
 
 if __name__ == "__main__":

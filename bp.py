@@ -111,6 +111,7 @@ def scan(
 def sync(
     address: str = typer.Argument(..., help="Device name (from bp devices) or UUID/address"),
     user: Optional[int] = typer.Option(None, help="Filter by user slot (1 or 2)"),
+    debug: bool = typer.Option(False, "--debug", "-d", help="Print raw BLE protocol events"),
 ):
     """Connect to device and sync all stored records."""
     resolved = devices.resolve(address)
@@ -137,9 +138,16 @@ def sync(
             f"pulse {rec.get('pulse', '—')}"
         )
 
+    def on_debug(msg: str):
+        console.print(f"[dim cyan]dbg  {msg}[/dim cyan]")
+
     console.print(f"Connecting to [bold]{resolved}[/bold]…")
     try:
-        asyncio.run(ble.sync_records(resolved, progress_cb=on_record))
+        asyncio.run(ble.sync_records(
+            resolved,
+            progress_cb=on_record,
+            debug_cb=on_debug if debug else None,
+        ))
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)

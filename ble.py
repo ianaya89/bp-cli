@@ -111,18 +111,23 @@ async def scan_devices(
     ]
 
 
-async def sync_records(address: str, progress_cb=None) -> list[dict]:
+async def sync_records(address: str, progress_cb=None, debug_cb=None) -> list[dict]:
     """
     Connect, trigger record dump, return all BP records.
-    Mirrors the subscription sequence that probe confirmed works.
-    progress_cb(record) called for each record as it arrives.
+    progress_cb(record) called for each BP record as it arrives.
+    debug_cb(msg) called with protocol debug strings when provided.
     """
     OMRON_DATA   = "b305b680-aee7-11e1-a730-0002a5d5c51b"
     OMRON_STATUS = "49123040-aee8-11e1-a74d-0002a5d5c51b"
 
+    def dbg(msg: str):
+        if debug_cb:
+            debug_cb(msg)
+
     records: list[dict] = []
     got_first   = asyncio.Event()
     last_ts: list[float] = [0.0]
+    status_bytes: list[bytes] = []
 
     def on_bp_measure(_, data: bytearray):
         rec = parse_bp_measurement(bytes(data))
@@ -133,10 +138,9 @@ async def sync_records(address: str, progress_cb=None) -> list[dict]:
             if progress_cb:
                 progress_cb(rec)
 
-    def _noop(_, __):
-        pass
-
-    TRANSFER_ACK = bytes([0x01] + [0x00] * 19)
+    def on_status(_, data: bytearray):
+        status_bytes.append(bytes(data))
+        dbg(f"OMRON_STATUS  {bytes(data).hex()}  {list(data)}")
 
     async with BleakClient(address) as client:
         if not client.is_connected:
@@ -145,25 +149,27 @@ async def sync_records(address: str, progress_cb=None) -> list[dict]:
         # Set device clock so future measurements get timestamps
         try:
             await client.write_gatt_char(CURRENT_TIME, _current_time_bytes(), response=False)
-        except Exception:
-            pass
+            dbg("CURRENT_TIME  write OK")
+        except Exception as e:
+            dbg(f"CURRENT_TIME  write FAILED: {e}")
 
         # Subscribe to all notifiable chars — device checks these before sending
         await client.start_notify(BP_MEASURE, on_bp_measure)
         try:
-            await client.start_notify(OMRON_DATA, _noop)
-        except Exception:
-            pass
+            await client.start_notify(OMRON_DATA, lambda _, d: dbg(f"OMRON_DATA  {bytes(d).hex()}"))
+        except Exception as e:
+            dbg(f"OMRON_DATA  subscribe FAILED: {e}")
         try:
-            await client.start_notify(OMRON_STATUS, _noop)
-        except Exception:
-            pass
+            await client.start_notify(OMRON_STATUS, on_status)
+        except Exception as e:
+            dbg(f"OMRON_STATUS  subscribe FAILED: {e}")
 
         # Wait for subscriptions to fully register with device
         await asyncio.sleep(1.0)
 
         # Trigger full record dump
         await client.write_gatt_char(OMRON_CMD, TRIGGER_CMD, response=True)
+        dbg(f"OMRON_CMD trigger  {TRIGGER_CMD.hex()}")
 
         # Wait for first record
         try:
@@ -179,12 +185,18 @@ async def sync_records(address: str, progress_cb=None) -> list[dict]:
             if asyncio.get_event_loop().time() - last_ts[0] >= SILENCE_TIMEOUT:
                 break
 
-        await client.stop_notify(BP_MEASURE)
+        dbg(f"drain done  {len(records)} records  status_msgs={len(status_bytes)}")
 
-        # Acknowledge transfer so device clears pending records and stops showing err
+        # Ack before stopping notifications — device may need active subscription to confirm
+        # 0x01 + 19 zeros = "transfer acknowledged" for most Omron BLESmart devices
+        TRANSFER_ACK = bytes([0x01] + [0x00] * 19)
         try:
-            await client.write_gatt_char(OMRON_CMD, TRANSFER_ACK, response=True)
-        except Exception:
-            pass
+            await client.write_gatt_char(OMRON_CMD, TRANSFER_ACK, response=False)
+            dbg(f"OMRON_CMD ack  {TRANSFER_ACK.hex()}  (write-without-response)")
+        except Exception as e:
+            dbg(f"OMRON_CMD ack FAILED: {e}")
+
+        await asyncio.sleep(0.5)
+        await client.stop_notify(BP_MEASURE)
 
     return records

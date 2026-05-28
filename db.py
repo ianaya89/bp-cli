@@ -30,6 +30,18 @@ def insert_measurement(conn: sqlite3.Connection, m: dict) -> bool:
     """Insert measurement; return True if new, False if duplicate."""
     ts = m.get("timestamp")
     ts_str = ts.isoformat() if isinstance(ts, datetime) else str(ts) if ts else None
+
+    # For null-timestamp records, dedup by values — SQLite UNIQUE treats NULLs as distinct
+    if ts_str is None:
+        existing = conn.execute(
+            """SELECT 1 FROM measurements
+               WHERE timestamp IS NULL
+               AND systolic=? AND diastolic=? AND pulse=? AND user_id=?""",
+            (m["systolic"], m["diastolic"], m.get("pulse"), m.get("user", 1)),
+        ).fetchone()
+        if existing:
+            return False
+
     try:
         conn.execute(
             """INSERT INTO measurements

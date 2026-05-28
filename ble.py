@@ -86,7 +86,7 @@ def _current_time_bytes() -> bytes:
     """Pack current time for GATT Current Time characteristic (0x2A2B)."""
     now = datetime.now()
     return struct.pack(
-        "<HBBBBBBB",
+        "<HBBBBBBBB",
         now.year, now.month, now.day,
         now.hour, now.minute, now.second,
         now.isoweekday(),  # 1=Mon … 7=Sun
@@ -136,9 +136,17 @@ async def sync_records(address: str, progress_cb=None) -> list[dict]:
     def _noop(_, __):
         pass
 
+    TRANSFER_ACK = bytes([0x01] + [0x00] * 19)
+
     async with BleakClient(address) as client:
         if not client.is_connected:
             raise RuntimeError("Failed to connect")
+
+        # Set device clock so future measurements get timestamps
+        try:
+            await client.write_gatt_char(CURRENT_TIME, _current_time_bytes(), response=False)
+        except Exception:
+            pass
 
         # Subscribe to all notifiable chars — device checks these before sending
         await client.start_notify(BP_MEASURE, on_bp_measure)
@@ -172,5 +180,11 @@ async def sync_records(address: str, progress_cb=None) -> list[dict]:
                 break
 
         await client.stop_notify(BP_MEASURE)
+
+        # Acknowledge transfer so device clears pending records and stops showing err
+        try:
+            await client.write_gatt_char(OMRON_CMD, TRANSFER_ACK, response=True)
+        except Exception:
+            pass
 
     return records

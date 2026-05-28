@@ -64,6 +64,35 @@ def insert_measurement(conn: sqlite3.Connection, m: dict) -> bool:
         return False
 
 
+def fetch_by_id(conn: sqlite3.Connection, record_id: int) -> dict | None:
+    cur = conn.execute("SELECT * FROM measurements WHERE id = ?", (record_id,))
+    cols = [c[0] for c in cur.description]
+    row = cur.fetchone()
+    return dict(zip(cols, row)) if row else None
+
+
+def update_measurement(conn: sqlite3.Connection, record_id: int, fields: dict) -> bool:
+    if not fields:
+        return False
+    allowed = {"timestamp", "systolic", "diastolic", "pulse", "user_id"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    conn.execute(
+        f"UPDATE measurements SET {set_clause} WHERE id = ?",
+        (*updates.values(), record_id),
+    )
+    conn.commit()
+    return conn.total_changes > 0
+
+
+def delete_measurement(conn: sqlite3.Connection, record_id: int) -> bool:
+    conn.execute("DELETE FROM measurements WHERE id = ?", (record_id,))
+    conn.commit()
+    return conn.total_changes > 0
+
+
 def fetch_all(conn: sqlite3.Connection, user_id: int | None = None) -> list[dict]:
     query = "SELECT * FROM measurements"
     params: tuple = ()

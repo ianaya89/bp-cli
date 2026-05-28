@@ -6,6 +6,7 @@ Commands: scan | sync | list | stats
 
 import asyncio
 import sys
+from datetime import datetime
 from typing import Optional
 
 import typer
@@ -373,6 +374,128 @@ def chart(
     plt.title(f"Blood Pressure{' — User ' + str(user) if user else ''}")
 
     plt.show()
+
+
+def _parse_ts(value: str) -> str:
+    """Accept 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD HH:MM:SS', return ISO string."""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(value, fmt).isoformat()
+        except ValueError:
+            pass
+    raise typer.BadParameter(f"expected YYYY-MM-DD HH:MM or YYYY-MM-DD HH:MM:SS, got {value!r}")
+
+
+@app.command(name="add")
+def add_record(
+    systolic:  Optional[int] = typer.Argument(None, help="Systolic (mmHg)"),
+    diastolic: Optional[int] = typer.Argument(None, help="Diastolic (mmHg)"),
+    pulse:     Optional[int] = typer.Option(None,  help="Pulse (bpm)"),
+    timestamp: Optional[str] = typer.Option(None,  help="'YYYY-MM-DD HH:MM'"),
+    user:      int            = typer.Option(1,     help="User slot (1 or 2)"),
+    interactive: bool         = typer.Option(False, "--interactive", "-i"),
+):
+    """Manually add a blood pressure record."""
+    if interactive or systolic is None:
+        systolic  = typer.prompt("Systolic",  type=int, default=systolic)
+        diastolic = typer.prompt("Diastolic", type=int, default=diastolic)
+        pulse     = typer.prompt("Pulse",     type=int, default=pulse or 0) or None
+        ts_raw    = typer.prompt("Timestamp (YYYY-MM-DD HH:MM, blank=none)", default="")
+        timestamp = _parse_ts(ts_raw) if ts_raw.strip() else None
+        user      = typer.prompt("User slot", type=int, default=user)
+    else:
+        if diastolic is None:
+            console.print("[red]Error:[/red] diastolic required")
+            raise typer.Exit(1)
+        timestamp = _parse_ts(timestamp) if timestamp else None
+
+    conn = db.init_db()
+    rec = {
+        "systolic":  systolic,
+        "diastolic": diastolic,
+        "pulse":     pulse,
+        "timestamp": timestamp,
+        "user":      user,
+    }
+    if db.insert_measurement(conn, rec):
+        console.print(f"[green]Added.[/green]  {timestamp or '—'}  {systolic}/{diastolic} mmHg  pulse {pulse or '—'}")
+    else:
+        console.print("[yellow]Duplicate — not inserted.[/yellow]")
+
+
+@app.command(name="edit")
+def edit_record(
+    record_id: int            = typer.Argument(..., help="Record ID (from bp list)"),
+    systolic:  Optional[int]  = typer.Option(None, help="New systolic"),
+    diastolic: Optional[int]  = typer.Option(None, help="New diastolic"),
+    pulse:     Optional[int]  = typer.Option(None, help="New pulse"),
+    timestamp: Optional[str]  = typer.Option(None, help="New timestamp 'YYYY-MM-DD HH:MM'"),
+    user:      Optional[int]  = typer.Option(None, help="New user slot"),
+    interactive: bool         = typer.Option(False, "--interactive", "-i"),
+):
+    """Edit a stored record by ID."""
+    conn = db.init_db()
+    rec = db.fetch_by_id(conn, record_id)
+    if not rec:
+        console.print(f"[red]No record with id {record_id}[/red]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[dim]#{rec['id']}[/dim]  {rec.get('timestamp') or '—'}  "
+        f"[bold]{rec['systolic']}/{rec['diastolic']}[/bold] mmHg  "
+        f"pulse {rec.get('pulse') or '—'}  user {rec.get('user_id') or 1}"
+    )
+
+    if interactive:
+        ts_raw    = typer.prompt("Timestamp (blank=keep)", default=rec.get("timestamp") or "")
+        systolic  = typer.prompt("Systolic",  type=int, default=rec["systolic"])
+        diastolic = typer.prompt("Diastolic", type=int, default=rec["diastolic"])
+        pulse     = typer.prompt("Pulse",     type=int, default=rec.get("pulse") or 0) or None
+        user      = typer.prompt("User slot", type=int, default=rec.get("user_id") or 1)
+        timestamp = _parse_ts(ts_raw) if ts_raw.strip() else rec.get("timestamp")
+
+    fields: dict = {}
+    if systolic  is not None: fields["systolic"]  = systolic
+    if diastolic is not None: fields["diastolic"] = diastolic
+    if pulse     is not None: fields["pulse"]     = pulse
+    if user      is not None: fields["user_id"]   = user
+    if timestamp is not None: fields["timestamp"] = _parse_ts(timestamp) if not interactive else timestamp
+
+    if not fields:
+        console.print("[dim]Nothing to update.[/dim]")
+        return
+
+    if db.update_measurement(conn, record_id, fields):
+        console.print(f"[green]Updated #{record_id}.[/green]")
+    else:
+        console.print(f"[red]Update failed.[/red]")
+
+
+@app.command(name="rm")
+def remove_record(
+    record_id: int  = typer.Argument(..., help="Record ID (from bp list)"),
+    yes:       bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+):
+    """Delete a stored record by ID."""
+    conn = db.init_db()
+    rec = db.fetch_by_id(conn, record_id)
+    if not rec:
+        console.print(f"[red]No record with id {record_id}[/red]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[dim]#{rec['id']}[/dim]  {rec.get('timestamp') or '—'}  "
+        f"[bold]{rec['systolic']}/{rec['diastolic']}[/bold] mmHg  "
+        f"pulse {rec.get('pulse') or '—'}"
+    )
+
+    if not yes:
+        typer.confirm("Delete this record?", abort=True)
+
+    if db.delete_measurement(conn, record_id):
+        console.print(f"[green]Deleted #{record_id}.[/green]")
+    else:
+        console.print(f"[red]Delete failed.[/red]")
 
 
 devices_app = typer.Typer(help="Manage saved device aliases.")

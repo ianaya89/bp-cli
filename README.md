@@ -37,6 +37,12 @@ bp stats                         # averages, min, max per metric
 | `bp sync <uuid>` | Sync new records from device |
 | `bp list` | List stored records with stats footer |
 | `bp stats` | Averages, min, max from all records |
+| `bp chart` | Terminal line plot of systolic/diastolic over time |
+| `bp pdf` | Export printable PDF report (table + chart) |
+| `bp add <sys> <dia>` | Manually add a record |
+| `bp edit <id>` | Edit a record by ID |
+| `bp rm <id>` | Delete a record by ID |
+| `bp devices add/ls/rm` | Manage saved device aliases |
 | `bp discover <uuid>` | Dump all GATT services/characteristics |
 | `bp probe <uuid>` | Raw debug: subscribe + dump bytes |
 
@@ -49,6 +55,15 @@ bp list --user 2                 # filter by user slot
 bp list --limit 20
 bp sync <uuid> --user 1
 bp stats --user 2
+bp chart --pulse                 # include pulse rate line
+bp pdf                           # → YYYYMMDD_bp_report.pdf in cwd
+bp pdf --output ~/Desktop/bp.pdf --user 1 --limit 100 --pulse
+bp add 120 80 --pulse 65 --timestamp '2024-01-15 08:30'
+bp add -i                        # interactive prompt
+bp edit 42 --systolic 118 -i
+bp rm 42 --yes
+bp devices add omron <uuid>
+bp sync omron                    # use saved alias
 ```
 
 ## Data

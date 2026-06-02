@@ -376,6 +376,169 @@ def chart(
     plt.show()
 
 
+@app.command(name="pdf")
+def export_pdf(
+    user:   Optional[int] = typer.Option(None, help="Filter by user slot"),
+    limit:  int           = typer.Option(200, help="Max records to include"),
+    pulse:  bool          = typer.Option(False, "--pulse", "-p", help="Include pulse line in chart"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Output path (default: ~/bp_report_YYYYMMDD.pdf)"),
+):
+    """Generate a printable PDF report with table and chart."""
+    import io
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import cm
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table as RLTable, TableStyle, KeepTogether
+    from reportlab.graphics.shapes import Drawing, Line, String
+    from reportlab.graphics.charts.lineplots import LinePlot
+    from reportlab.graphics.charts.legends import Legend
+    from reportlab.graphics import renderPDF
+
+    conn = db.init_db()
+    records = db.fetch_all(conn, user_id=user)[:limit]
+
+    if not records:
+        console.print("[yellow]No records.[/yellow]")
+        raise typer.Exit(1)
+
+    out_path = output or f"{datetime.now().strftime('%Y%m%d')}_bp_report.pdf"
+
+    doc = SimpleDocTemplate(
+        out_path,
+        pagesize=A4,
+        leftMargin=2*cm, rightMargin=2*cm,
+        topMargin=2*cm, bottomMargin=2*cm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("title", parent=styles["Heading1"], fontSize=16, spaceAfter=6)
+    sub_style   = ParagraphStyle("sub",   parent=styles["Normal"],   fontSize=9, textColor=colors.grey)
+
+    story = []
+
+    # ── Title ─────────────────────────────────────────────────────────────────
+    user_label = f" — User {user}" if user else ""
+    story.append(Paragraph(f"Blood Pressure Report{user_label}", title_style))
+    story.append(Paragraph(f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}  ·  {len(records)} records", sub_style))
+    story.append(Spacer(1, 0.4*cm))
+
+    # ── Stats summary ─────────────────────────────────────────────────────────
+    s = db.fetch_stats(conn, user_id=user)
+    if s["count"]:
+        sv, dv, pv = s["systolic"], s["diastolic"], s["pulse"]
+        summary = (
+            f"<b>Avg:</b> {sv['avg']}/{dv['avg']} mmHg  "
+            f"<b>Min:</b> {sv['min']}/{dv['min']}  "
+            f"<b>Max:</b> {sv['max']}/{dv['max']}  "
+            f"<b>Pulse avg:</b> {pv['avg']} bpm"
+        )
+        story.append(Paragraph(summary, styles["Normal"]))
+        story.append(Spacer(1, 0.5*cm))
+
+    # ── Chart ─────────────────────────────────────────────────────────────────
+    chart_records = list(reversed(records))  # oldest → newest left-to-right
+    xs     = list(range(1, len(chart_records) + 1))
+    sys_v  = [r["systolic"]  for r in chart_records]
+    dia_v  = [r["diastolic"] for r in chart_records]
+    pul_v  = [r.get("pulse") or 0 for r in chart_records]
+
+    W, H = 17*cm, 8*cm
+    d = Drawing(W, H)
+
+    lp = LinePlot()
+    lp.x, lp.y = 1.2*cm, 0.8*cm
+    lp.width    = W - 2.4*cm
+    lp.height   = H - 1.6*cm
+
+    series = [(sys_v, colors.red, "Systolic"), (dia_v, colors.steelblue, "Diastolic")]
+    if pulse and any(pul_v):
+        series.append((pul_v, colors.darkorange, "Pulse"))
+
+    lp.data = [list(zip(xs, vals)) for vals, _, _ in series]
+
+    for i, (_, color, _) in enumerate(series):
+        lp.lines[i].strokeColor = color
+        lp.lines[i].strokeWidth = 1.5
+
+    lp.xValueAxis.valueMin = 1
+    lp.xValueAxis.valueMax = len(xs)
+    lp.xValueAxis.labelTextFormat = ""
+    lp.yValueAxis.valueMin = 40
+    lp.yValueAxis.valueMax = max(max(sys_v), 160) + 10
+
+    # Reference lines at 140 (sys) and 90 (dia)
+    def _ref_line(y_val, color):
+        y_pct = (y_val - lp.yValueAxis.valueMin) / (lp.yValueAxis.valueMax - lp.yValueAxis.valueMin)
+        y_px  = lp.y + y_pct * lp.height
+        ln = Line(lp.x, y_px, lp.x + lp.width, y_px)
+        ln.strokeColor    = color
+        ln.strokeWidth    = 0.5
+        ln.strokeDashArray = [4, 3]
+        return ln
+
+    d.add(lp)
+    d.add(_ref_line(140, colors.red))
+    d.add(_ref_line(90,  colors.steelblue))
+
+    legend = Legend()
+    legend.x, legend.y   = lp.x, H - 0.7*cm
+    legend.deltax = 80
+    legend.colorNamePairs = [(color, name) for _, color, name in series]
+    legend.columnMaximum  = len(series)
+    legend.fontName = "Helvetica"
+    legend.fontSize = 8
+    d.add(legend)
+
+    story.append(KeepTogether([renderPDF.GraphicsFlowable(d)]))
+    story.append(Spacer(1, 0.4*cm))
+
+    # ── Table ─────────────────────────────────────────────────────────────────
+    header = ["#", "Timestamp", "Systolic", "Diastolic", "MAP", "Pulse", "User"]
+    rows   = [header]
+
+    def _rl_color(sys, dia):
+        if sys >= 140 or dia >= 90: return colors.HexColor("#c0392b")
+        if sys >= 130 or dia >= 80: return colors.HexColor("#e67e22")
+        return colors.HexColor("#27ae60")
+
+    cell_colors = [None]  # header row placeholder
+    for r in records:
+        rows.append([
+            str(r["id"]),
+            r.get("timestamp") or "—",
+            str(r["systolic"]),
+            str(r["diastolic"]),
+            str(r.get("mean_ap") or "—"),
+            str(r.get("pulse") or "—"),
+            str(r.get("user_id") or "1"),
+        ])
+        cell_colors.append(_rl_color(r["systolic"], r["diastolic"]))
+
+    tbl = RLTable(rows, repeatRows=1)
+
+    tbl_style = [
+        ("BACKGROUND",  (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+        ("TEXTCOLOR",   (0, 0), (-1, 0), colors.white),
+        ("FONTNAME",    (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE",    (0, 0), (-1, -1), 8),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8f9fa")]),
+        ("GRID",        (0, 0), (-1, -1), 0.25, colors.HexColor("#dee2e6")),
+        ("ALIGN",       (2, 0), (-1, -1), "RIGHT"),
+        ("TOPPADDING",  (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]
+    for row_idx, color in enumerate(cell_colors[1:], start=1):
+        for col in (2, 3):  # systolic, diastolic columns
+            tbl_style.append(("TEXTCOLOR", (col, row_idx), (col, row_idx), color))
+
+    tbl.setStyle(TableStyle(tbl_style))
+    story.append(tbl)
+
+    doc.build(story)
+    console.print(f"[green]PDF saved:[/green] {out_path}")
+
+
 def _parse_ts(value: str) -> str:
     """Accept 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD HH:MM:SS', return ISO string."""
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):

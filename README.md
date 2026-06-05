@@ -202,7 +202,7 @@ Bump `version` in `pyproject.toml` (e.g. `0.1.0` → `0.2.0`), commit, then tag 
 git tag v0.2.0 && git push origin main --tags
 ```
 
-The **Release** workflow verifies the tag matches the `pyproject.toml` version, builds the wheel + sdist, and publishes a GitHub Release with the artifacts and auto-generated notes. PyPI publishing via Trusted Publishing is wired but commented out in `.github/workflows/release.yml` — enable it once a PyPI project exists.
+Update [`CHANGELOG.md`](CHANGELOG.md) before tagging. The **Release** workflow verifies the tag matches the `pyproject.toml` version, builds the wheel + sdist, and publishes a GitHub Release with the artifacts and auto-generated notes. PyPI publishing via Trusted Publishing is wired but commented out in `.github/workflows/release.yml` — enable it once a PyPI project exists.
 
 ## Device compatibility
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-bp — Omron blood pressure CLI
-Commands: scan | sync | list | stats
+obp — Omron blood pressure CLI
+Commands: scan | sync | list | stats | web
 """
 
 import asyncio
@@ -14,12 +14,44 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
-import ble
-import db
-import devices
+from . import ble
+from . import db
+from . import devices
+from . import tags
 
 app = typer.Typer(no_args_is_help=True, help="Omron BP monitor sync tool")
 console = Console()
+
+
+def _validate_tags(names: list[str]) -> list[str]:
+    """Ensure every name is in the vocabulary; else abort with a hint."""
+    vocab = set(tags.list_all())
+    unknown = [n for n in names if n not in vocab]
+    if unknown:
+        console.print(f"[red]Unknown tag(s):[/red] {', '.join(unknown)}")
+        console.print("[dim]Add them first: obp tags add <name>[/dim]")
+        raise typer.Exit(1)
+    return names
+
+
+def _date_range(days: int, since: Optional[str], until: Optional[str]):
+    """Resolve --days/--since/--until into (since_iso, until_iso) or (None, None)."""
+    from datetime import timedelta
+
+    def _day(value: str, end: bool) -> str:
+        d = datetime.strptime(value, "%Y-%m-%d")
+        if end:
+            d = d.replace(hour=23, minute=59, second=59)
+        return d.isoformat()
+
+    until_iso = _day(until, end=True) if until else None
+
+    if since:
+        return _day(since, end=False), until_iso
+    if days and days > 0:
+        start = datetime.now() - timedelta(days=days)
+        return start.isoformat(), until_iso
+    return None, until_iso
 
 
 def _bp_color(systolic: int, diastolic: int) -> str:
@@ -36,23 +68,75 @@ def _print_records(records: list[dict]):
         return
 
     t = Table(box=box.SIMPLE_HEAD, show_footer=False)
+    t.add_column("ID",    style="dim", justify="right", min_width=3)
     t.add_column("Timestamp",  style="dim", min_width=19)
     t.add_column("Sys",   justify="right", min_width=4)
     t.add_column("Dia",   justify="right", min_width=4)
     t.add_column("MAP",   justify="right", min_width=4)
     t.add_column("Pulse", justify="right", min_width=5)
     t.add_column("User",  justify="right", min_width=4)
+    t.add_column("Tags",  style="cyan")
 
     for r in records:
         color = _bp_color(r["systolic"], r["diastolic"])
         t.add_row(
+            str(r.get("id") or "—"),
             r.get("timestamp") or "—",
             f"[{color}]{r['systolic']}[/{color}]",
             f"[{color}]{r['diastolic']}[/{color}]",
             str(r.get("mean_ap") or "—"),
             str(r.get("pulse") or "—"),
             str(r.get("user_id") or "1"),
+            " ".join(r.get("tags") or []) or "[dim]—[/dim]",
         )
+
+    console.print(t)
+
+
+def _print_grouped(groups: list[dict], expand: bool):
+    """Print sessions: lead (lowest) row, members nested when expand=True."""
+    if not groups:
+        console.print("[dim]No records.[/dim]")
+        return
+
+    t = Table(box=box.SIMPLE_HEAD, show_footer=False)
+    t.add_column("ID",    style="dim", justify="right", min_width=3)
+    t.add_column("Timestamp",  style="dim", min_width=19)
+    t.add_column("Sys",   justify="right", min_width=4)
+    t.add_column("Dia",   justify="right", min_width=4)
+    t.add_column("MAP",   justify="right", min_width=4)
+    t.add_column("Pulse", justify="right", min_width=5)
+    t.add_column("User",  justify="right", min_width=4)
+    t.add_column("Tags",  style="cyan")
+
+    for grp in groups:
+        lead = grp["lead"]
+        color = _bp_color(lead["systolic"], lead["diastolic"])
+        badge = f"  [yellow]▸{grp['count']}[/yellow]" if grp["count"] > 1 else ""
+        t.add_row(
+            str(lead.get("id") or "—"),
+            (lead.get("timestamp") or "—") + badge,
+            f"[{color}]{lead['systolic']}[/{color}]",
+            f"[{color}]{lead['diastolic']}[/{color}]",
+            str(lead.get("mean_ap") or "—"),
+            str(lead.get("pulse") or "—"),
+            str(lead.get("user_id") or "1"),
+            " ".join(lead.get("tags") or []) or "[dim]—[/dim]",
+        )
+        if expand and grp["count"] > 1:
+            for m in grp["members"]:
+                if m is lead:
+                    continue
+                t.add_row(
+                    f"[dim]{m.get('id')}[/dim]",
+                    f"[dim]  └ {m.get('timestamp') or '—'}[/dim]",
+                    f"[dim]{m['systolic']}[/dim]",
+                    f"[dim]{m['diastolic']}[/dim]",
+                    f"[dim]{m.get('mean_ap') or '—'}[/dim]",
+                    f"[dim]{m.get('pulse') or '—'}[/dim]",
+                    f"[dim]{m.get('user_id') or 1}[/dim]",
+                    f"[dim]{' '.join(m.get('tags') or []) or '—'}[/dim]",
+                )
 
     console.print(t)
 
@@ -102,15 +186,15 @@ def scan(
             raise typer.Exit(1)
         if is_fallback:
             console.print("[yellow]No Omron devices found. All visible BLE devices:[/yellow]")
-            console.print("[dim]Identify your Omron in the list, then: bp sync <address>[/dim]")
+            console.print("[dim]Identify your Omron in the list, then: obp sync <address>[/dim]")
         _print_device_table(pairs)
 
-    console.print("[dim]Use Address/UUID with [bold]bp sync <address>[/bold][/dim]")
+    console.print("[dim]Use Address/UUID with [bold]obp sync <address>[/bold][/dim]")
 
 
 @app.command()
 def sync(
-    address: str = typer.Argument(..., help="Device name (from bp devices) or UUID/address"),
+    address: str = typer.Argument(..., help="Device name (from obp devices) or UUID/address"),
     user: Optional[int] = typer.Option(None, help="Filter by user slot (1 or 2)"),
     debug: bool = typer.Option(False, "--debug", "-d", help="Print raw BLE protocol events"),
 ):
@@ -260,13 +344,34 @@ def probe(
 def list_records(
     user: Optional[int] = typer.Option(None, help="Filter by user slot"),
     limit: int = typer.Option(50, help="Max records to show"),
+    days: int = typer.Option(30, help="Show last N days (0 = all time)"),
+    since: Optional[str] = typer.Option(None, help="From date 'YYYY-MM-DD' (overrides --days)"),
+    until: Optional[str] = typer.Option(None, help="To date 'YYYY-MM-DD'"),
+    tag: Optional[str] = typer.Option(None, help="Filter by tag"),
+    group: bool = typer.Option(True, "--group/--no-group", help="Group readings within --window minutes"),
+    expand: bool = typer.Option(False, "--expand", "-e", help="Show grouped readings (not just the lowest)"),
+    window: int = typer.Option(5, help="Session window in minutes for grouping"),
 ):
     """List stored blood pressure records with averages footer."""
-    conn = db.init_db()
-    records = db.fetch_all(conn, user_id=user)[:limit]
-    _print_records(records)
+    since_iso, until_iso = _date_range(days, since, until)
+    if since_iso or until_iso:
+        lo = since_iso[:10] if since_iso else "start"
+        hi = until_iso[:10] if until_iso else "now"
+        console.print(f"[dim]Range: {lo} → {hi}[/dim]")
 
-    s = db.fetch_stats(conn, user_id=user)
+    conn = db.init_db()
+    records = db.fetch_all(conn, user_id=user, since=since_iso, until=until_iso, tag=tag)
+
+    if group:
+        groups = db.group_sessions(records, window_minutes=window)[:limit]
+        _print_grouped(groups, expand=expand)
+        if not expand and any(g["count"] > 1 for g in groups):
+            console.print("[dim]▸N = readings within "
+                          f"{window}m; lowest shown. Use --expand to see all.[/dim]")
+    else:
+        _print_records(records[:limit])
+
+    s = db.fetch_stats(conn, user_id=user, since=since_iso, until=until_iso, tag=tag)
     if s["count"]:
         sv, dv, pv = s["systolic"], s["diastolic"], s["pulse"]
         avg_color = _bp_color(int(sv["avg"] or 0), int(dv["avg"] or 0))
@@ -282,13 +387,16 @@ def list_records(
 
 
 @app.command()
-def stats(user: Optional[int] = typer.Option(None, help="Filter by user slot")):
+def stats(
+    user: Optional[int] = typer.Option(None, help="Filter by user slot"),
+    tag: Optional[str] = typer.Option(None, help="Filter by tag"),
+):
     """Show averages and min/max from stored records."""
     conn = db.init_db()
-    s = db.fetch_stats(conn, user_id=user)
+    s = db.fetch_stats(conn, user_id=user, tag=tag)
 
     if s["count"] == 0:
-        console.print("[yellow]No records. Run [bold]bp sync[/bold] first.[/yellow]")
+        console.print("[yellow]No records. Run [bold]obp sync[/bold] first.[/yellow]")
         raise typer.Exit(1)
 
     t = Table(box=box.SIMPLE_HEAD, title=f"Stats ({s['count']} records)")
@@ -324,12 +432,13 @@ def chart(
     user: Optional[int] = typer.Option(None, help="Filter by user slot"),
     limit: int = typer.Option(60, help="Max records to plot"),
     pulse: bool = typer.Option(False, "--pulse", "-p", help="Also plot pulse rate"),
+    tag: Optional[str] = typer.Option(None, help="Filter by tag"),
 ):
     """Plot systolic/diastolic (and optionally pulse) over time."""
     import plotext as plt
 
     conn = db.init_db()
-    records = db.fetch_all(conn, user_id=user)[:limit]
+    records = db.fetch_all(conn, user_id=user, tag=tag)[:limit]
     records = list(reversed(records))  # oldest first for left→right
 
     if not records:
@@ -381,6 +490,7 @@ def export_pdf(
     user:   Optional[int] = typer.Option(None, help="Filter by user slot"),
     limit:  int           = typer.Option(200, help="Max records to include"),
     pulse:  bool          = typer.Option(False, "--pulse", "-p", help="Include pulse line in chart"),
+    tag:    Optional[str] = typer.Option(None, help="Filter by tag"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output path (default: ~/bp_report_YYYYMMDD.pdf)"),
 ):
     """Generate a printable PDF report with table and chart."""
@@ -396,7 +506,7 @@ def export_pdf(
     from reportlab.graphics import renderPDF
 
     conn = db.init_db()
-    records = db.fetch_all(conn, user_id=user)[:limit]
+    records = db.fetch_all(conn, user_id=user, tag=tag)[:limit]
 
     if not records:
         console.print("[yellow]No records.[/yellow]")
@@ -424,7 +534,7 @@ def export_pdf(
     story.append(Spacer(1, 0.4*cm))
 
     # ── Stats summary ─────────────────────────────────────────────────────────
-    s = db.fetch_stats(conn, user_id=user)
+    s = db.fetch_stats(conn, user_id=user, tag=tag)
     if s["count"]:
         sv, dv, pv = s["systolic"], s["diastolic"], s["pulse"]
         summary = (
@@ -494,7 +604,7 @@ def export_pdf(
     story.append(Spacer(1, 0.4*cm))
 
     # ── Table ─────────────────────────────────────────────────────────────────
-    header = ["#", "Timestamp", "Systolic", "Diastolic", "MAP", "Pulse", "User"]
+    header = ["#", "Timestamp", "Systolic", "Diastolic", "MAP", "Pulse", "User", "Tags"]
     rows   = [header]
 
     def _rl_color(sys, dia):
@@ -512,6 +622,7 @@ def export_pdf(
             str(r.get("mean_ap") or "—"),
             str(r.get("pulse") or "—"),
             str(r.get("user_id") or "1"),
+            ", ".join(r.get("tags") or []) or "—",
         ])
         cell_colors.append(_rl_color(r["systolic"], r["diastolic"]))
 
@@ -524,7 +635,7 @@ def export_pdf(
         ("FONTSIZE",    (0, 0), (-1, -1), 8),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8f9fa")]),
         ("GRID",        (0, 0), (-1, -1), 0.25, colors.HexColor("#dee2e6")),
-        ("ALIGN",       (2, 0), (-1, -1), "RIGHT"),
+        ("ALIGN",       (2, 0), (6, -1), "RIGHT"),
         ("TOPPADDING",  (0, 0), (-1, -1), 3),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
     ]
@@ -556,9 +667,11 @@ def add_record(
     pulse:     Optional[int] = typer.Option(None,  help="Pulse (bpm)"),
     timestamp: Optional[str] = typer.Option(None,  help="'YYYY-MM-DD HH:MM'"),
     user:      int            = typer.Option(1,     help="User slot (1 or 2)"),
+    tag:       list[str]      = typer.Option(None,  "--tag", "-t", help="Attach tag (repeatable)"),
     interactive: bool         = typer.Option(False, "--interactive", "-i"),
 ):
     """Manually add a blood pressure record."""
+    tag = _validate_tags(tag) if tag else []
     if interactive or systolic is None:
         systolic  = typer.prompt("Systolic",  type=int, default=systolic)
         diastolic = typer.prompt("Diastolic", type=int, default=diastolic)
@@ -579,21 +692,25 @@ def add_record(
         "pulse":     pulse,
         "timestamp": timestamp,
         "user":      user,
+        "tags":      tag,
     }
     if db.insert_measurement(conn, rec):
-        console.print(f"[green]Added.[/green]  {timestamp or '—'}  {systolic}/{diastolic} mmHg  pulse {pulse or '—'}")
+        tag_str = ("  tags: " + " ".join(tag)) if tag else ""
+        console.print(f"[green]Added.[/green]  {timestamp or '—'}  {systolic}/{diastolic} mmHg  pulse {pulse or '—'}{tag_str}")
     else:
         console.print("[yellow]Duplicate — not inserted.[/yellow]")
 
 
 @app.command(name="edit")
 def edit_record(
-    record_id: int            = typer.Argument(..., help="Record ID (from bp list)"),
+    record_id: int            = typer.Argument(..., help="Record ID (from obp list)"),
     systolic:  Optional[int]  = typer.Option(None, help="New systolic"),
     diastolic: Optional[int]  = typer.Option(None, help="New diastolic"),
     pulse:     Optional[int]  = typer.Option(None, help="New pulse"),
     timestamp: Optional[str]  = typer.Option(None, help="New timestamp 'YYYY-MM-DD HH:MM'"),
     user:      Optional[int]  = typer.Option(None, help="New user slot"),
+    add_tag:   list[str]      = typer.Option(None, "--add-tag", help="Add tag (repeatable)"),
+    rm_tag:    list[str]      = typer.Option(None, "--rm-tag", help="Remove tag (repeatable)"),
     interactive: bool         = typer.Option(False, "--interactive", "-i"),
 ):
     """Edit a stored record by ID."""
@@ -606,7 +723,8 @@ def edit_record(
     console.print(
         f"[dim]#{rec['id']}[/dim]  {rec.get('timestamp') or '—'}  "
         f"[bold]{rec['systolic']}/{rec['diastolic']}[/bold] mmHg  "
-        f"pulse {rec.get('pulse') or '—'}  user {rec.get('user_id') or 1}"
+        f"pulse {rec.get('pulse') or '—'}  user {rec.get('user_id') or 1}  "
+        f"tags {' '.join(rec.get('tags') or []) or '—'}"
     )
 
     if interactive:
@@ -624,6 +742,17 @@ def edit_record(
     if user      is not None: fields["user_id"]   = user
     if timestamp is not None: fields["timestamp"] = _parse_ts(timestamp) if not interactive else timestamp
 
+    if add_tag or rm_tag:
+        _validate_tags(add_tag or [])
+        new_tags = list(rec.get("tags") or [])
+        for tg in (add_tag or []):
+            if tg not in new_tags:
+                new_tags.append(tg)
+        for tg in (rm_tag or []):
+            if tg in new_tags:
+                new_tags.remove(tg)
+        fields["tags"] = new_tags
+
     if not fields:
         console.print("[dim]Nothing to update.[/dim]")
         return
@@ -636,7 +765,7 @@ def edit_record(
 
 @app.command(name="rm")
 def remove_record(
-    record_id: int  = typer.Argument(..., help="Record ID (from bp list)"),
+    record_id: int  = typer.Argument(..., help="Record ID (from obp list)"),
     yes:       bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ):
     """Delete a stored record by ID."""
@@ -661,6 +790,27 @@ def remove_record(
         console.print(f"[red]Delete failed.[/red]")
 
 
+@app.command(name="web")
+def web_ui(
+    host: str = typer.Option("127.0.0.1", help="Bind host"),
+    port: int = typer.Option(8000, help="Bind port"),
+):
+    """Start a local web UI to browse records."""
+    from . import web
+
+    url = f"http://{host}:{port}"
+    console.print(f"Serving on [bold]{url}[/bold]  [dim](Ctrl-C to stop)[/dim]")
+    try:
+        import webbrowser
+        webbrowser.open(url)
+    except Exception:
+        pass
+    try:
+        web.serve(host, port)
+    except KeyboardInterrupt:
+        console.print("\n[dim]Stopped.[/dim]")
+
+
 devices_app = typer.Typer(help="Manage saved device aliases.")
 app.add_typer(devices_app, name="devices")
 
@@ -668,7 +818,7 @@ app.add_typer(devices_app, name="devices")
 @devices_app.command(name="add")
 def devices_add(
     name: str = typer.Argument(..., help="Friendly name"),
-    address: str = typer.Argument(..., help="Device UUID/address from bp scan"),
+    address: str = typer.Argument(..., help="Device UUID/address from obp scan"),
 ):
     """Save a friendly name for a device address."""
     devices.add(name, address)
@@ -690,7 +840,7 @@ def devices_ls():
     """List all saved device aliases."""
     saved = devices.list_all()
     if not saved:
-        console.print("[dim]No saved devices. Use: bp devices add <name> <uuid>[/dim]")
+        console.print("[dim]No saved devices. Use: obp devices add <name> <uuid>[/dim]")
         return
     t = Table(box=box.SIMPLE_HEAD)
     t.add_column("Name", style="bold")
@@ -698,6 +848,41 @@ def devices_ls():
     for name, addr in saved.items():
         t.add_row(name, addr)
     console.print(t)
+
+
+tags_app = typer.Typer(help="Manage the tag vocabulary.")
+app.add_typer(tags_app, name="tags")
+
+
+@tags_app.command(name="add")
+def tags_add(name: str = typer.Argument(..., help="Tag name")):
+    """Add a tag to the vocabulary."""
+    if tags.add(name):
+        console.print(f"[green]Added tag:[/green] [cyan]{name}[/cyan]")
+    else:
+        console.print(f"[yellow]Tag already exists or empty:[/yellow] {name}")
+
+
+@tags_app.command(name="rm")
+def tags_rm(name: str = typer.Argument(..., help="Tag name to remove")):
+    """Remove a tag from the vocabulary and strip it from all records."""
+    if tags.remove(name):
+        conn = db.init_db()
+        n = db.remove_tag_from_all(conn, name)
+        console.print(f"[dim]Removed tag:[/dim] {name}  [dim](cleared from {n} record(s))[/dim]")
+    else:
+        console.print(f"[yellow]Not found:[/yellow] {name}")
+        raise typer.Exit(1)
+
+
+@tags_app.command(name="ls")
+def tags_ls():
+    """List all tags in the vocabulary."""
+    vocab = tags.list_all()
+    if not vocab:
+        console.print("[dim]No tags. Use: obp tags add <name>[/dim]")
+        return
+    console.print("  ".join(f"[cyan]{t}[/cyan]" for t in vocab))
 
 
 if __name__ == "__main__":

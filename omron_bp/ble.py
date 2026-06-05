@@ -16,6 +16,7 @@ from datetime import datetime
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
+from bleak.exc import BleakError
 
 OMRON_NAME_PREFIX = ("OMRON", "HEM-", "BLESMART")
 
@@ -26,6 +27,37 @@ CURRENT_TIME = "00002a2b-0000-1000-8000-00805f9b34fb"
 TRIGGER_CMD       = bytes(20)   # 20 zero bytes triggers full record dump
 SILENCE_TIMEOUT   = 3.0         # seconds of no new records = transfer done
 FIRST_REC_TIMEOUT = 15.0        # seconds to wait for first record before giving up
+CONNECT_TIMEOUT   = 20.0        # seconds for the BLE connection itself
+SCAN_TIMEOUT      = 12.0        # seconds to locate device before connecting
+CONNECT_RETRIES   = 3           # Omron links drop often; retry the connect
+
+_NOT_ADVERTISING = (
+    "Device not found while scanning. The monitor's BLE radio is off until you wake it: "
+    "press the Bluetooth button so the symbol blinks, then re-run immediately."
+)
+
+
+async def _find_device(address: str, debug_cb=None) -> BLEDevice:
+    """
+    Resolve an address/UUID to a live BLEDevice by scanning.
+
+    On macOS the address is a per-host CoreBluetooth UUID that only resolves
+    while the peripheral is advertising — so a pre-scan turns an opaque connect
+    failure into a clear 'wake the device' message.
+    """
+    dev = await BleakScanner.find_device_by_address(address, timeout=SCAN_TIMEOUT)
+    if dev is None:
+        # Fall back to a name match — some devices rotate their address UUID.
+        found = await BleakScanner.discover(timeout=4.0, return_adv=True)
+        for d, _adv in found.values():
+            if d.address == address or (
+                d.name and any(d.name.upper().startswith(p) for p in OMRON_NAME_PREFIX)
+            ):
+                if debug_cb:
+                    debug_cb(f"matched device by scan fallback: {d.name} {d.address}")
+                return d
+        raise RuntimeError(_NOT_ADVERTISING)
+    return dev
 
 
 def _sfloat(raw: int) -> float:
@@ -133,7 +165,7 @@ async def sync_records(address: str, progress_cb=None, debug_cb=None) -> list[di
         rec = parse_bp_measurement(bytes(data))
         if rec:
             records.append(rec)
-            last_ts[0] = asyncio.get_event_loop().time()
+            last_ts[0] = asyncio.get_running_loop().time()
             got_first.set()
             if progress_cb:
                 progress_cb(rec)
@@ -142,7 +174,28 @@ async def sync_records(address: str, progress_cb=None, debug_cb=None) -> list[di
         status_bytes.append(bytes(data))
         dbg(f"OMRON_STATUS  {bytes(data).hex()}  {list(data)}")
 
-    async with BleakClient(address) as client:
+    dbg(f"scanning for {address} …")
+    device = await _find_device(address, debug_cb=debug_cb)
+    dbg(f"found {device.name or '<unknown>'} {device.address} — connecting")
+
+    client = BleakClient(device, timeout=CONNECT_TIMEOUT)
+    last_err = None
+    for attempt in range(1, CONNECT_RETRIES + 1):
+        try:
+            await client.connect()
+            break
+        except (BleakError, asyncio.TimeoutError) as e:
+            last_err = e
+            dbg(f"connect attempt {attempt}/{CONNECT_RETRIES} failed: {e}")
+            if attempt < CONNECT_RETRIES:
+                await asyncio.sleep(1.5)
+    else:
+        raise RuntimeError(
+            f"Connection failed after {CONNECT_RETRIES} attempts: {last_err}. "
+            "Wake the monitor (BT symbol blinking) and retry."
+        )
+
+    try:
         if not client.is_connected:
             raise RuntimeError("Failed to connect")
 
@@ -182,7 +235,7 @@ async def sync_records(address: str, progress_cb=None, debug_cb=None) -> list[di
         # Drain until 3s silence = transfer complete
         while True:
             await asyncio.sleep(0.25)
-            if asyncio.get_event_loop().time() - last_ts[0] >= SILENCE_TIMEOUT:
+            if asyncio.get_running_loop().time() - last_ts[0] >= SILENCE_TIMEOUT:
                 break
 
         dbg(f"drain done  {len(records)} records  status_msgs={len(status_bytes)}")
@@ -198,5 +251,7 @@ async def sync_records(address: str, progress_cb=None, debug_cb=None) -> list[di
 
         await asyncio.sleep(0.5)
         await client.stop_notify(BP_MEASURE)
+    finally:
+        await client.disconnect()
 
     return records

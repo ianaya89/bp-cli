@@ -1,9 +1,6 @@
 """One-shot: insert the 30 records captured during the probe session."""
-import sys
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
-
-from ble import parse_bp_measurement
-import db
+from omron_bp.ble import parse_bp_measurement
+from omron_bp import db
 
 RAW_HEX = [
     "1e750050005c00000000000000004a00010000",

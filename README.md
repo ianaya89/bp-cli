@@ -1,5 +1,7 @@
 # omron-bp
 
+[![CI](https://github.com/ianaya89/omron-bp/actions/workflows/ci.yml/badge.svg)](https://github.com/ianaya89/omron-bp/actions/workflows/ci.yml)
+
 CLI and local web UI to sync and display blood pressure records from Omron BLESmart BLE monitors. Works on **macOS** (CoreBluetooth) and **Linux** (BlueZ).
 
 Reverse-engineered from the HEM-7144T2 (wrist monitor). Works with any Omron device that advertises as `BLESmart_*` and exposes the `0xFE4A` proprietary service.
@@ -141,6 +143,22 @@ BP classification (color-coded in output):
 The device only sends records that haven't been transferred yet — it tracks the transfer state internally. After a successful sync, those records won't be sent again until new measurements are taken. Wake the monitor by pressing its Bluetooth button (the BLE symbol blinks), then run `obp sync` immediately.
 
 Protocol: write `bytes(20)` to the Omron proprietary CMD characteristic → records arrive as standard GATT Blood Pressure Measurement (0x2A35) indications → 3s silence = transfer complete.
+
+## Releasing
+
+CI runs on every push/PR (test matrix on macOS + Linux, Python 3.10–3.13, plus a
+wheel build). To cut a release:
+
+1. Bump `version` in `pyproject.toml` (e.g. `0.1.0` → `0.2.0`).
+2. Commit, then tag and push:
+   ```bash
+   git tag v0.2.0 && git push origin main --tags
+   ```
+
+The **Release** workflow verifies the tag matches the pyproject version, builds the
+wheel + sdist, and publishes a GitHub Release with the artifacts and auto-generated
+notes. (PyPI publishing via Trusted Publishing is wired but commented out in
+`.github/workflows/release.yml` — enable it once a PyPI project exists.)
 
 ## Device compatibility
 
